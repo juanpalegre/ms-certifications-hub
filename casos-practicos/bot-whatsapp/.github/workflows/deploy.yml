@@ -1,0 +1,177 @@
+name: Deploy — Azure Container Apps
+
+# Disparadores:
+# 1. Push a main → despliega automáticamente a staging, luego espera aprobación para producción
+# 2. workflow_dispatch → permite elegir el entorno manualmente (útil para rollbacks)
+#
+# CONCEPTO GH-600: El entorno "production" en GitHub tiene "required reviewers" configurados.
+# Esto crea el human-in-the-loop gate: ningún agente puede desplegar a producción sin aprobación humana.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options: [staging, production]
+
+env:
+  # GitHub Container Registry — imágenes privadas ligadas al repositorio
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/clubbot
+  NODE_VERSION: '20'
+
+jobs:
+  # ─────────────────────────────────────────────────────────────
+  # JOB 1: Construir y publicar la imagen Docker
+  # El digest SHA se usa como referencia inmutable en los despliegues.
+  # Garantiza trazabilidad: sabemos exactamente qué código está en producción.
+  # ─────────────────────────────────────────────────────────────
+  build-and-push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    outputs:
+      # Outputs compartidos con los jobs de despliegue
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+    permissions:
+      contents: read
+      packages: write  # Necesario para publicar en GHCR
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # BuildKit para builds multi-stage y caché eficiente
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Genera tags automáticamente: SHA corto, nombre de rama, semver si hay tag
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=,format=short
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+
+      # Build con caché de GitHub Actions — reduce tiempo de build en ~60%
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 2: Despliegue a Staging
+  # Automático tras cada push a main.
+  # El entorno "staging" en GitHub puede tener wait timers pero NO required reviewers.
+  # ─────────────────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment:
+      name: staging
+      url: https://clubbot-staging.azurecontainerapps.io
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS_STAGING }}
+
+      - name: Deploy to Azure Container Apps (Staging)
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          resourceGroup: rg-clubbot-staging
+          containerAppName: clubbot-staging
+          imageToDeploy: ${{ needs.build-and-push.outputs.image-tag }}
+          # Variables de entorno inyectadas desde GitHub Secrets — nunca en el código
+          environmentVariables: |
+            AZURE_OPENAI_ENDPOINT=${{ secrets.AZURE_OPENAI_ENDPOINT_STAGING }}
+            REDIS_URL=${{ secrets.REDIS_URL_STAGING }}
+            DATABASE_URL=${{ secrets.DATABASE_URL_STAGING }}
+            ENVIRONMENT=staging
+
+      # Smoke test básico: verifica que el contenedor arranció y responde
+      - name: Run smoke tests against staging
+        run: |
+          sleep 30  # espera a que el contenedor arranque
+          curl -f https://clubbot-staging.azurecontainerapps.io/health || exit 1
+          echo "✅ Staging deployment healthy"
+
+      # Anotación de despliegue para correlacionar con métricas en Application Insights
+      - name: Create deployment annotation in Application Insights
+        run: |
+          echo "Deployment to staging: ${{ needs.build-and-push.outputs.image-digest }}"
+          # En producción real: llamar a la REST API de App Insights para crear la anotación
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 3: Despliegue a Producción
+  # REQUIERE APROBACIÓN HUMANA — configurada en el entorno "production" de GitHub.
+  #
+  # CONCEPTO GH-600: Este es el "environment gate".
+  # Aunque el Copilot coding agent puede crear PRs y pasar el CI,
+  # NO PUEDE aprobar su propio despliegue a producción.
+  # Un revisor humano debe ir a la UI de GitHub Actions y hacer clic en "Approve".
+  # ─────────────────────────────────────────────────────────────
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build-and-push, deploy-staging]
+    environment:
+      name: production
+      url: https://clubbot.azurecontainerapps.io
+    # El entorno "production" en GitHub Settings > Environments tiene:
+    # - Required reviewers: lista de personas que deben aprobar
+    # - Wait timer: opcional, p.ej. 10 minutos de observación en staging primero
+    # GitHub pausa aquí y envía notificación a los revisores requeridos
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS_PRODUCTION }}
+
+      - name: Deploy to Azure Container Apps (Production)
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          resourceGroup: rg-clubbot-prod
+          containerAppName: clubbot-prod
+          imageToDeploy: ${{ needs.build-and-push.outputs.image-tag }}
+          environmentVariables: |
+            AZURE_OPENAI_ENDPOINT=${{ secrets.AZURE_OPENAI_ENDPOINT_PROD }}
+            REDIS_URL=${{ secrets.REDIS_URL_PROD }}
+            DATABASE_URL=${{ secrets.DATABASE_URL_PROD }}
+            ENVIRONMENT=production
+
+      # Health check más largo en producción — el tráfico real necesita tiempo
+      - name: Post-deployment health check
+        run: |
+          sleep 60
+          curl -f https://clubbot.azurecontainerapps.io/health || exit 1
+
+      # Registro de auditoría: quién aprobó, qué imagen, cuándo
+      - name: Notify deployment success
+        if: success()
+        run: |
+          echo "🚀 Production deployment successful"
+          echo "   Image digest: ${{ needs.build-and-push.outputs.image-digest }}"
+          echo "   Approved by: ${{ github.actor }}"
+          echo "   Triggered by: ${{ github.event_name }}"
+          echo "   Commit: ${{ github.sha }}"

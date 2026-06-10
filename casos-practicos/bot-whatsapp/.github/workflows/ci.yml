@@ -1,0 +1,184 @@
+name: CI — Validate Pull Request
+
+# Se ejecuta en cada PR hacia main o develop, y en pushes a develop.
+# IMPORTANTE: Los PRs creados por el Copilot coding agent también deben pasar este CI.
+# El job "ci-success" es el required status check configurado en branch protection.
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [develop]
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  # ─────────────────────────────────────────────────────────────
+  # JOB 1: Lint y verificación de tipos TypeScript
+  # ─────────────────────────────────────────────────────────────
+  lint-and-typecheck:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - run: npm ci
+
+      # ESLint — falla si hay errores (warnings permitidos en CI)
+      - run: npm run lint
+
+      # TypeScript strict mode — sin "any" implícitos
+      - run: npm run type-check
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 2: Tests unitarios con cobertura mínima del 80%
+  # ─────────────────────────────────────────────────────────────
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: lint-and-typecheck
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Run unit tests with coverage
+        run: npm run test:unit -- --coverage
+
+      # Falla si la cobertura cae por debajo del 80% (configurado en jest.config.ts)
+      - name: Check coverage threshold (80%)
+        run: npm run test:coverage-check
+
+      # El reporte se sube aunque los tests fallen (if: always())
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage/
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 3: Tests de integración con Redis real y APIs mockeadas
+  # ─────────────────────────────────────────────────────────────
+  integration-tests:
+    name: Integration Tests (Mock APIs)
+    runs-on: ubuntu-latest
+    needs: lint-and-typecheck
+    # Redis como servicio Docker — disponible en localhost:6379
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+    env:
+      REDIS_URL: redis://localhost:6379
+      # Secrets de entorno de test (solo lectura, sin datos reales de producción)
+      AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT_TEST }}
+      AZURE_OPENAI_KEY: ${{ secrets.AZURE_OPENAI_KEY_TEST }}
+      # USE_MOCK_APIS=true hace que el bot use respuestas simuladas de OpenAI
+      USE_MOCK_APIS: 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Run integration tests
+        run: npm run test:integration
+
+      - name: Upload integration test artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-test-results
+          path: test-results/
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 4: Validación de seguridad del BookingAgent
+  # Solo se ejecuta si el PR toca archivos del módulo de reservas.
+  # Garantiza que el agente de reservas siempre pide confirmación humana.
+  # ─────────────────────────────────────────────────────────────
+  booking-agent-validation:
+    name: BookingAgent Safety Validation
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    # Condicional: solo corre si el PR modifica archivos de booking
+    if: |
+      contains(github.event.pull_request.changed_files, 'src/agents/booking') ||
+      contains(github.event.pull_request.changed_files, 'src/mcp/booking')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - run: npm ci
+
+      # Tests específicos que validan el flujo de confirmación de reservas
+      - name: Run booking safety tests
+        run: npm run test:booking-safety
+
+      # Script que verifica estáticamente que el confirmation gate no fue eliminado
+      - name: Verify confirmation gate exists
+        run: npm run validate:booking-confirmation-gate
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB 5: Escaneo de seguridad
+  # Detecta dependencias vulnerables y secrets hardcodeados
+  # ─────────────────────────────────────────────────────────────
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Falla si hay vulnerabilidades HIGH o CRITICAL en dependencias npm
+      - name: Run npm audit
+        run: npm audit --audit-level=high
+
+      # Busca patrones de API keys hardcodeadas en el código fuente
+      - name: Scan for hardcoded secrets
+        run: |
+          if grep -rn "AZURE_OPENAI_KEY\s*=\s*['\"][^$]" src/ ; then
+            echo "❌ Hardcoded secret found!"
+            exit 1
+          fi
+          echo "✅ No hardcoded secrets found"
+
+  # ─────────────────────────────────────────────────────────────
+  # JOB RESUMEN: Required status check para branch protection
+  # Este es el ÚNICO check que se configura en la regla de rama.
+  # Simplifica la configuración: si este pasa, todo pasó.
+  # ─────────────────────────────────────────────────────────────
+  ci-success:
+    name: CI Passed
+    runs-on: ubuntu-latest
+    needs: [lint-and-typecheck, unit-tests, integration-tests, security-scan]
+    if: always()
+    steps:
+      - name: Check all jobs passed
+        run: |
+          if [[ "${{ needs.lint-and-typecheck.result }}" != "success" ]] || \
+             [[ "${{ needs.unit-tests.result }}" != "success" ]] || \
+             [[ "${{ needs.integration-tests.result }}" != "success" ]] || \
+             [[ "${{ needs.security-scan.result }}" != "success" ]]; then
+            echo "❌ One or more CI checks failed"
+            exit 1
+          fi
+          echo "✅ All CI checks passed — PR is ready for review"
