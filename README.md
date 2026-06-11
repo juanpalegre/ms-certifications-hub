@@ -34,7 +34,7 @@ Un hub de divulgación sobre el ecosistema Microsoft AI: certificaciones, Azure 
 
 | Sección | Qué hay |
 |---|---|
-| [certs/ab-100/](./certs/ab-100/) | **AB-100** — Agentic AI Business Solutions Architect |
+| [certs/ab-100/](./certs/ab-100/) | **AB-100** — guías por sección del examen + cheat-sheet |
 | [certs/ai-103/](./certs/ai-103/) | **AI-103** — guías por sección del examen + cheat-sheet |
 | [certs/gh-600/](./certs/gh-600/) | **GH-600** — guías de las 6 secciones + cheat-sheet (md y PDF) |
 | [temas/](./temas/) | Contenido transversal: Agentic AI, Azure AI, novedades de Microsoft Learn |
